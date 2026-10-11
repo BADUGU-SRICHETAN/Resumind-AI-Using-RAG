@@ -10,7 +10,7 @@ or:
 
 import re
 
-from rag_backup import RAG_SYSTEM, answer_multi_candidate_question
+from rag import RAG_SYSTEM, answer_multi_candidate_question
 from screening import is_candidate_search_query, candidate_search
 
 FALLBACK_ANSWER = (
