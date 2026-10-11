@@ -9,4 +9,4 @@ langchain-text-splitters
 chromadb
 rank-bm25
 pypdf
-plotly
+plotly==6.3.0
