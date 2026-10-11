@@ -14,8 +14,8 @@ __pycache__/
 *.py[cod]
 
 # Private resumes
-Resumes/
-resumes/
+# Resumes/
+# resumes/
 
 # Local vector databases
 ResumeRAG/
