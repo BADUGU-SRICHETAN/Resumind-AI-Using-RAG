@@ -1,11 +1,13 @@
-import os
+from pathlib import Path
+
+code = r'''import os
 import re
 from pathlib import Path
 from collections import defaultdict
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
-from langchain_community.document_loaders import DirectoryLoader
+from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.retrievers import BM25Retriever
 
@@ -18,11 +20,9 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
 FALLBACK_ANSWER = (
     "I couldn't find sufficient information in the retrieved resumes."
 )
-
 RESUME_DIR = BASE_DIR / "Resumes"
 
 if not OPENAI_API_KEY:
@@ -64,7 +64,6 @@ def source_key(source):
 def get_candidate_tokens(source):
     """Return filename tokens useful for candidate matching."""
     filename = normalize_text(Path(source).stem)
-
     ignored_words = {
         "resume", "resumes", "cv", "updated", "final", "latest",
         "new", "profile", "document", "copy", "job", "application",
@@ -72,7 +71,6 @@ def get_candidate_tokens(source):
         "developer", "analyst", "intern", "sample", "dummy",
         "project", "version",
     }
-
     return [
         token for token in filename.split()
         if token not in ignored_words and len(token) > 1
@@ -93,19 +91,36 @@ chunks_by_source = defaultdict(list)
 resume_text_by_source = {}
 
 try:
-    # Create the folder if it is missing.
-    # This prevents FileNotFoundError on deployment.
     RESUME_DIR.mkdir(parents=True, exist_ok=True)
 
-    loader = DirectoryLoader(
-        str(RESUME_DIR),
-        glob="**/*.pdf",
-        recursive=True,
-        show_progress=False,
-        silent_errors=True,
-    )
+    # Explicitly use PyPDFLoader so the app does not require
+    # the optional "unstructured" package on Streamlit Cloud.
+    pdf_paths = sorted(RESUME_DIR.rglob("*.pdf"))
 
-    documents = loader.load()
+    if not pdf_paths:
+        print(f"WARNING: No PDF files found in {RESUME_DIR}")
+
+    for pdf_path in pdf_paths:
+        try:
+            loader = PyPDFLoader(str(pdf_path))
+            pdf_documents = loader.load()
+
+            # Keep only pages that contain extractable text.
+            readable_documents = [
+                doc for doc in pdf_documents
+                if doc.page_content and doc.page_content.strip()
+            ]
+
+            documents.extend(readable_documents)
+
+            if not readable_documents:
+                print(
+                    f"WARNING: No extractable text found in "
+                    f"{pdf_path.name}. It may be scanned or image-only."
+                )
+
+        except Exception as exc:
+            print(f"WARNING: Failed to load {pdf_path.name}: {exc}")
 
     if documents:
         splitter = RecursiveCharacterTextSplitter(
@@ -124,16 +139,17 @@ try:
                 doc.page_content for doc in source_chunks
             )
 
-        print(f"Documents loaded: {len(documents)}")
+        print(f"PDF pages loaded: {len(documents)}")
         print(f"Chunks created: {len(chunks)}")
         print(f"Resume files indexed: {len(chunks_by_source)}")
+        print(f"Resume folder: {RESUME_DIR}")
 
     else:
-        print("WARNING: No readable PDF resumes found.")
+        print("WARNING: No readable PDF resume text was found.")
         print(f"Resume folder: {RESUME_DIR}")
         print(
-            "Add readable PDF files to the Resumes folder "
-            "to enable resume queries."
+            "Add text-based PDF files to the Resumes folder. "
+            "Scanned PDFs may require OCR."
         )
 
 except Exception as exc:
@@ -167,12 +183,10 @@ def find_candidate_matches(query):
     """Find possible candidate resumes using filename tokens."""
     query_tokens = set(normalize_text(query).split())
     possible_name_tokens = query_tokens - QUERY_STOPWORDS
-
     matches = []
 
     for source, source_chunks in chunks_by_source.items():
         name_tokens = set(get_candidate_tokens(source))
-
         if not name_tokens:
             continue
 
@@ -183,7 +197,6 @@ def find_candidate_matches(query):
             len(compact_name) >= 6
             and compact_name in compact_query
         )
-
         joined_partial_match = any(
             len(token) >= 6 and token in compact_query
             for token in name_tokens
@@ -193,21 +206,16 @@ def find_candidate_matches(query):
 
         if joined_name_match or joined_partial_match:
             score = 120 + len(overlap)
-
         elif len(name_tokens) >= 2 and name_tokens.issubset(query_tokens):
             score = 100 + len(name_tokens)
-
         elif len(overlap) >= 2:
             score = 50 + len(overlap)
-
         elif len(overlap) == 1:
             token = next(iter(overlap))
-
             if len(token) >= 5:
                 score = 20
             else:
                 continue
-
         else:
             continue
 
@@ -228,7 +236,6 @@ def find_candidate_matches(query):
 
     for match in matches:
         key = source_key(match["source"])
-
         if key not in seen:
             seen.add(key)
             unique.append(match)
@@ -346,7 +353,6 @@ def detect_requested_sections(query):
 
 def is_multi_candidate_question(query):
     normalized = normalize_text(query)
-
     return any(
         phrase in normalized
         for phrase in MULTI_CANDIDATE_PHRASES
@@ -371,13 +377,11 @@ def extract_requested_skills(query):
 def find_skill_evidence(text, skills):
     """Find explicit mentions of requested skills in resume text."""
     raw_text = str(text or "")
-
     lines = [
         re.sub(r"\s+", " ", line).strip()
         for line in raw_text.splitlines()
     ]
     lines = [line for line in lines if line]
-
     evidence = {}
 
     section_pattern = re.compile(
@@ -391,7 +395,6 @@ def find_skill_evidence(text, skills):
             skill,
             [rf"\b{re.escape(skill)}\b"],
         )
-
         candidates = []
 
         for index, line in enumerate(lines):
@@ -422,7 +425,6 @@ def find_skill_evidence(text, skills):
                 score += 1
 
             snippet = line
-
             if (
                 index > 0
                 and section_pattern.search(lines[index - 1])
@@ -459,12 +461,10 @@ def find_skill_evidence(text, skills):
 def extract_resume_display_name(source, text):
     """Extract a plausible name from the resume header."""
     raw_text = str(text or "")
-
     raw_lines = [
         re.sub(r"\s+", " ", line).strip()
         for line in raw_text.splitlines()
     ]
-
     lines = [
         line.strip(" |•-:·")
         for line in raw_lines
@@ -507,31 +507,23 @@ def extract_resume_display_name(source, text):
 
         if not cleaned or len(cleaned) > 45 or "@" in cleaned:
             continue
-
         if re.search(r"\d", cleaned):
             continue
-
         if any(char in cleaned for char in "@:/\\"):
             continue
-
         if cleaned.lower().strip(".: ") in ignored_exact:
             continue
 
         words = cleaned.replace(".", " ").split()
-
         if not 2 <= len(words) <= 4:
             continue
-
         if not all(
             re.fullmatch(r"[A-Za-z][A-Za-z'’\-]*", word)
             for word in words
         ):
             continue
 
-        normalized_words = [
-            word.lower() for word in words
-        ]
-
+        normalized_words = [word.lower() for word in words]
         if any(
             word in heading_or_role_words
             for word in normalized_words
@@ -554,13 +546,11 @@ def extract_resume_display_name(source, text):
         r"\s+-\s+",
         filename_stem,
     )[-1]
-
     filename_candidate = re.sub(
         r"[_]+",
         " ",
         filename_candidate,
     )
-
     filename_candidate = re.sub(
         r"\b(FlowCV|Resume|CV|Updated|Final|Latest|Copy|"
         r"\d{4}[-_]\d{2}[-_]\d{2})\b",
@@ -568,7 +558,6 @@ def extract_resume_display_name(source, text):
         filename_candidate,
         flags=re.I,
     )
-
     filename_candidate = re.sub(
         r"\s+",
         " ",
@@ -609,7 +598,6 @@ def retrieve_from_one_resume(query, source_chunks, max_chunks=8):
         retriever = BM25Retriever.from_documents(source_chunks)
         retriever.k = min(max_chunks, len(source_chunks))
         results = retriever.invoke(query)
-
     except Exception as exc:
         print(f"BM25 retrieval warning: {exc}")
         results = []
@@ -618,7 +606,6 @@ def retrieve_from_one_resume(query, source_chunks, max_chunks=8):
 
     for doc in source_chunks:
         content = normalize_text(doc.page_content)
-
         for section in requested_sections:
             if any(
                 normalize_text(term) in content
@@ -632,7 +619,6 @@ def retrieve_from_one_resume(query, source_chunks, max_chunks=8):
 
     for doc in results:
         key = normalize_text(doc.page_content)
-
         if key not in seen_content:
             seen_content.add(key)
             unique_results.append(doc)
@@ -649,7 +635,6 @@ def retrieve_general_context(query, top_k=12):
         retriever = BM25Retriever.from_documents(chunks)
         retriever.k = min(top_k, len(chunks))
         retrieved_docs = retriever.invoke(query)
-
     except Exception as exc:
         print(f"General retrieval warning: {exc}")
         return []
@@ -662,7 +647,6 @@ def retrieve_general_context(query, top_k=12):
             get_source(doc),
             normalize_text(doc.page_content),
         )
-
         if key not in seen:
             seen.add(key)
             unique_docs.append(doc)
@@ -683,7 +667,6 @@ def generate_answer(query, retrieved_docs):
 
     for doc in retrieved_docs:
         source = Path(get_source(doc)).name
-
         context_parts.append(
             f"[Resume source: {source}]\n{doc.page_content}"
         )
@@ -721,12 +704,9 @@ ANSWER:
         answer = response.content
 
         if isinstance(answer, list):
-            answer = "\n".join(
-                str(item) for item in answer
-            )
+            answer = "\n".join(str(item) for item in answer)
 
         answer = str(answer).strip()
-
         return answer if answer else FALLBACK_ANSWER
 
     except Exception as exc:
@@ -738,10 +718,7 @@ ANSWER:
 # 9. MULTI-CANDIDATE SEARCH
 # ============================================================
 
-def retrieve_multi_candidate_context(
-    query,
-    max_chunks_per_resume=3,
-):
+def retrieve_multi_candidate_context(query, max_chunks_per_resume=3):
     """Search resumes independently for candidates matching a query."""
     requested_skills = extract_requested_skills(query)
     candidate_evidence = []
@@ -750,10 +727,7 @@ def retrieve_multi_candidate_context(
         full_text = resume_text_by_source.get(source, "")
 
         if requested_skills:
-            evidence = find_skill_evidence(
-                full_text,
-                requested_skills,
-            )
+            evidence = find_skill_evidence(full_text, requested_skills)
 
             # Require all explicitly requested skills.
             if len(evidence) != len(requested_skills):
@@ -766,8 +740,7 @@ def retrieve_multi_candidate_context(
                     doc.page_content,
                     requested_skills,
                 )
-
-                if doc_evidence:
+                if len(doc_evidence) == len(requested_skills):
                     matching_chunks.append(doc)
 
             if not matching_chunks:
@@ -808,10 +781,7 @@ def retrieve_multi_candidate_context(
     return candidate_evidence
 
 
-def format_multi_candidate_skill_answer(
-    candidate_groups,
-    requested_skills,
-):
+def format_multi_candidate_skill_answer(candidate_groups, requested_skills):
     """Format candidate skill matches directly from resume evidence."""
     if not candidate_groups:
         return FALLBACK_ANSWER
@@ -831,29 +801,16 @@ def format_multi_candidate_skill_answer(
     ]
 
     for index, group in enumerate(candidate_groups, start=1):
-        lines.append(
-            f"{index}. {group['display_name']}"
-        )
-        lines.append(
-            f"   Source: {Path(group['source']).name}"
-        )
+        lines.append(f"{index}. {group['display_name']}")
+        lines.append(f"   Source: {Path(group['source']).name}")
 
         for skill in requested_skills:
             snippets = group["evidence"].get(skill, [])
-
             if snippets:
-                snippet = re.sub(
-                    r"\s+",
-                    " ",
-                    snippets[0],
-                ).strip()
-
+                snippet = re.sub(r"\s+", " ", snippets[0]).strip()
                 if len(snippet) > 220:
                     snippet = snippet[:217].rstrip() + "..."
-
-                lines.append(
-                    f"   - {skill} evidence: “{snippet}”"
-                )
+                lines.append(f"   - {skill} evidence: “{snippet}”")
 
         lines.append("")
 
@@ -876,7 +833,6 @@ def answer_multi_candidate_question(query):
         )
 
     all_docs = []
-
     for group in candidate_groups:
         all_docs.extend(group["chunks"])
 
@@ -903,11 +859,7 @@ def RAG_SYSTEM(query):
         print(f"Resumes searched: {len(chunks_by_source)}")
 
         groups = retrieve_multi_candidate_context(query)
-
-        print(
-            "Candidate resumes with evidence:",
-            len(groups),
-        )
+        print("Candidate resumes with evidence:", len(groups))
 
         if not groups:
             return FALLBACK_ANSWER
@@ -918,10 +870,8 @@ def RAG_SYSTEM(query):
 
     if candidate_matches:
         best_score = candidate_matches[0]["score"]
-
         best_matches = [
-            match
-            for match in candidate_matches
+            match for match in candidate_matches
             if match["score"] == best_score
         ]
 
@@ -934,7 +884,6 @@ def RAG_SYSTEM(query):
 
                 for doc in match["chunks"]:
                     content = normalize_text(doc.page_content)
-
                     if any(
                         normalize_text(term) in content
                         for section in requested_sections
@@ -947,7 +896,6 @@ def RAG_SYSTEM(query):
                     match["chunks"],
                     max_chunks=8,
                 )
-
             else:
                 selected_docs = retrieve_from_one_resume(
                     query,
@@ -959,19 +907,14 @@ def RAG_SYSTEM(query):
 
         if retrieved_docs:
             print("\nCandidate-specific retrieval:")
-
             for match in best_matches:
                 print("Matched resume:", match["source"])
-
             print("Retrieved chunks:", len(retrieved_docs))
-
             return generate_answer(query, retrieved_docs)
 
     retrieved_docs = retrieve_general_context(query)
-
     print("\nGeneral resume retrieval")
     print("Retrieved chunks:", len(retrieved_docs))
-
     return generate_answer(query, retrieved_docs)
 
 
@@ -1021,8 +964,7 @@ def RAG_SYSTEM_WITH_CONTEXT(query):
 
                 for skill, snippets in group["evidence"].items():
                     block_lines.append(
-                        f"{skill} evidence: "
-                        + " | ".join(snippets[:2])
+                        f"{skill} evidence: " + " | ".join(snippets[:2])
                     )
 
                 contexts.append("\n".join(block_lines))
@@ -1041,7 +983,6 @@ def RAG_SYSTEM_WITH_CONTEXT(query):
             }
 
         retrieved_docs = []
-
         for group in groups:
             retrieved_docs.extend(group["chunks"])
 
@@ -1050,15 +991,12 @@ def RAG_SYSTEM_WITH_CONTEXT(query):
 
         if candidate_matches:
             best_score = candidate_matches[0]["score"]
-
             best_matches = [
-                match
-                for match in candidate_matches
+                match for match in candidate_matches
                 if match["score"] == best_score
             ]
 
             retrieved_docs = []
-
             for match in best_matches:
                 retrieved_docs.extend(
                     retrieve_from_one_resume(
@@ -1067,7 +1005,6 @@ def RAG_SYSTEM_WITH_CONTEXT(query):
                         max_chunks=8,
                     )
                 )
-
         else:
             retrieved_docs = retrieve_general_context(query)
 
@@ -1079,7 +1016,6 @@ def RAG_SYSTEM_WITH_CONTEXT(query):
             get_source(doc),
             normalize_text(doc.page_content),
         )
-
         if key not in seen:
             seen.add(key)
             unique_docs.append(doc)
@@ -1089,9 +1025,7 @@ def RAG_SYSTEM_WITH_CONTEXT(query):
     return {
         "question": query,
         "answer": answer,
-        "contexts": [
-            doc.page_content for doc in unique_docs
-        ],
+        "contexts": [doc.page_content for doc in unique_docs],
         "sources": sorted({
             Path(get_source(doc)).name
             for doc in unique_docs
@@ -1122,3 +1056,12 @@ if __name__ == "__main__":
         print("QUESTION:", question)
         print("=" * 65)
         print(RAG_SYSTEM(question))
+'''
+
+output_path = Path("/mnt/data/rag.py")
+output_path.write_text(code, encoding="utf-8")
+
+# Basic syntax validation before sharing the file.
+compile(code, str(output_path), "exec")
+
+print(f"Created and syntax-checked: {output_path}")
